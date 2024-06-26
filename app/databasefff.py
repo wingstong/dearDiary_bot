@@ -20,7 +20,8 @@ async def get_user(username: str, password: str):
     try:
         async with await get_db_connection() as conn:
             async with conn.cursor() as cursor:
-                await cursor.execute("SELECT Id_user FROM Users WHERE Username = ? AND Password = ?", (username, password))
+                await cursor.execute("SELECT Id_user FROM Users WHERE Username = ? AND Password = ?",
+                                     (username, password))
                 user = await cursor.fetchone()
         return user
     except Exception as e:
@@ -42,7 +43,8 @@ async def add_user(username: str, password: str, email: str):
     try:
         async with await get_db_connection() as conn:
             async with conn.cursor() as cursor:
-                await cursor.execute("INSERT INTO Users (Username, Password, Email) VALUES (?, ?, ?)", (username, password, email))
+                await cursor.execute("INSERT INTO Users (Username, Password, Email) VALUES (?, ?, ?)",
+                                     (username, password, email))
                 await conn.commit()
     except Exception as e:
         logging.error(f"Error adding user: {e}")

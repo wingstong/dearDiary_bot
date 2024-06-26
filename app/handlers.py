@@ -4,14 +4,16 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from sqlalchemy import select
 
-from app.database import (
-    get_user, check_user_exists, add_user, get_tasks, add_task, toggle_task, get_task_status, get_diary_entries
-)
-from app.keyboards import language_selection, sections_reply_en, sections_reply_ru
+import app.keyboards as kb
+import app.database.requests as rq
+from app.database.models import *
 from app.texts import texts
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 router = Router()
+
 
 class Form(StatesGroup):
     language = State()
@@ -19,100 +21,112 @@ class Form(StatesGroup):
     registration = State()
     task_description = State()
     task_deadline = State()
+    book_namebook = State()
+    book_author = State()
+    book_description = State()
     task_list = State()
+
 
 @router.message(CommandStart())
 async def c_start(message: Message, state: FSMContext):
     await state.set_state(Form.language)
-    await message.reply(texts['en']['choose_language'], reply_markup=language_selection, parse_mode='HTML')
+    await rq.set_user(message.from_user.id)
+    tg_id = message.from_user.id
+    user = await rq.set_user(tg_id)
+    await state.update_data(user_id=user.Id_user)
+    await message.answer(texts['en']['choose_language'], reply_markup=kb.language_selection, parse_mode='HTML')
+
 
 @router.callback_query(lambda c: c.data.startswith('lang_'))
 async def set_language(callback_query: CallbackQuery, state: FSMContext):
     lang_code = callback_query.data.split('_')[1]
+    await callback_query.answer("")
     await state.update_data(language=lang_code)
     await state.set_state(Form.authorization)
-    await callback_query.message.answer(texts[lang_code]['authorize'], parse_mode='HTML')
+    sect_keyboard = kb.sections_inline_en if lang_code == 'en' else kb.sections_inline_ru
+    await callback_query.message.answer(texts[lang_code]['welcome'], reply_markup=sect_keyboard, parse_mode='HTML')
 
-@router.message(StateFilter(Form.authorization))
-async def authorize_user(message: Message, state: FSMContext):
+
+async def get_user_tasks(session: async_session, user_id: int):
+    async with session() as db_session:
+        result = await db_session.execute(select(TODO).where(TODO.user_id == user_id))
+        return result.scalars().all()
+
+
+async def tasks(state: FSMContext, session: async_session):
     user_data = await state.get_data()
     lang_code = user_data.get('language', 'en')
+    user_id = user_data.get('user_id')
+    all_tasks = await get_user_tasks(session, user_id)
+    keyboard = InlineKeyboardBuilder()
+    for task in all_tasks:
+        status = '✅' if task.isComplete else '❌'
+        button_text = f"{task.taskText} - {task.deadLine} - {status}"
+        keyboard.add(InlineKeyboardButton(text=button_text, callback_data=f"task_toggle_{task.Id_task}"))
 
-    login_details = message.text.split()
-    if len(login_details) != 2:
-        await message.answer(texts[lang_code]['authorize_error'], parse_mode='HTML')
-        return
+    button_add_text = 'Add Task' if lang_code == 'en' else 'Добавить задачу'
+    button_back_text = 'Back' if lang_code == 'en' else 'Назад'
+    keyboard.add(InlineKeyboardButton(text=button_add_text, callback_data='add_task'))
+    keyboard.add(InlineKeyboardButton(text=button_back_text, callback_data='back'))
+    return keyboard.adjust(1)
 
-    username, password = login_details
-    user = await get_user(username, password)
-
-    if user:
-        await state.update_data(user_id=user[0])
-        reply_keyboard = sections_reply_en if lang_code == 'en' else sections_reply_ru
-        await message.answer(texts[lang_code]['authorization_success'], reply_markup=reply_keyboard, parse_mode='HTML')
-        await state.reset_state()
-    else:
-        await message.answer(texts[lang_code]['authorization_failed'], parse_mode='HTML')
-
-@router.message(Command('signup'))
-async def start_signup(message: Message, state: FSMContext):
-    user_data = await state.get_data()
-    lang_code = user_data.get('language', 'en')
-    await state.set_state(Form.registration)
-    await message.answer(texts[lang_code]['signup'], parse_mode='HTML')
-
-@router.message(StateFilter(Form.registration))
-async def register_user(message: Message, state: FSMContext):
-    user_data = await state.get_data()
-    lang_code = user_data.get('language', 'en')
-
-    registration_details = message.text.split()
-    if len(registration_details) != 3:
-        await message.answer(texts[lang_code]['signup_error'], parse_mode='HTML')
-        return
-
-    username, password, email = registration_details
-    user = await check_user_exists(username)
-
-    if user:
-        await message.answer(texts[lang_code]['user_exists'], parse_mode='HTML')
-    else:
-        await add_user(username, password, email)
-        reply_keyboard = sections_reply_en if lang_code == 'en' else sections_reply_ru
-        await message.answer(texts[lang_code]['registration_success'], reply_markup=reply_keyboard, parse_mode='HTML')
-        await state.reset_state()
 
 @router.message(F.text.in_(['Task List', 'Список задач']))
 @router.message(Command('task_list'))
 @router.callback_query(F.data == 'task_list')
-async def task_list_handler(message_or_callback: Message | CallbackQuery, state: FSMContext):
+async def task_list_handler(callback_query: CallbackQuery, state: FSMContext):
+    await callback_query.answer("")
     user_data = await state.get_data()
     lang_code = user_data.get('language', 'en')
-    user_id = user_data.get('user_id')
+    tg_id = callback_query.from_user.id
+    user = await rq.set_user(tg_id)
+    if user:
+        await state.update_data(user_id=user.Id_user)
 
-    tasks = await get_tasks(user_id)
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    for task in tasks:
-        status = '✅' if task[3] else '❌'
-        button_text = f"{task[1]} - {task[2]} {status}"
-        keyboard.add(InlineKeyboardButton(text=button_text, callback_data=f"task_{task[0]}"))
-
-    button_add_text = 'Add Task' if lang_code == 'en' else 'Добавить задачу'
-    keyboard.add(InlineKeyboardButton(text=button_add_text, callback_data='add_task'))
-
-    if isinstance(message_or_callback, Message):
-        await message_or_callback.answer(texts[lang_code]['task_list'], reply_markup=keyboard, parse_mode='HTML')
+    keyboard = await tasks(state, async_session)
+    if isinstance(callback_query, Message):
+        await callback_query.edit_text(texts[lang_code]['task_list'], reply_markup=keyboard.as_markup(),
+                                       parse_mode='HTML')
     else:
-        await message_or_callback.message.answer(texts[lang_code]['task_list'], reply_markup=keyboard, parse_mode='HTML')
+        await callback_query.message.edit_text(texts[lang_code]['task_list'], reply_markup=keyboard.as_markup(),
+                                               parse_mode='HTML')
 
-@router.message(Command('add_task'))
-@router.callback_query(lambda c: c.data == 'add_task')
-async def add_task_handler(message_or_callback: Message | CallbackQuery, state: FSMContext):
+
+@router.callback_query(lambda c: c.data.startswith('task_toggle_'))
+async def toggle_task_status(callback_query: CallbackQuery, state: FSMContext):
+    user_data = await state.get_data()
+    lang_code = user_data.get('language', 'en')
+    task_id = int(callback_query.data.split('_')[2])
+    async with async_session() as session:
+        async with session.begin():
+            task = await session.get(TODO, task_id)
+            task.isComplete = not task.isComplete
+            await session.commit()
+    await callback_query.answer(texts[lang_code]['task_status_updated'])
+    await task_list_handler(callback_query, state)
+
+
+
+@router.callback_query(F.data == 'back')
+async def back_handler(callback_query: CallbackQuery, state: FSMContext):
+    await callback_query.answer("")
     user_data = await state.get_data()
     lang_code = user_data.get('language', 'en')
 
     await state.set_state(Form.task_description)
-    await message_or_callback.message.answer(texts[lang_code]['task_description'], parse_mode='HTML')
+    sect_keyboard = kb.sections_inline_en if lang_code == 'en' else kb.sections_inline_ru
+    await callback_query.message.answer(texts[lang_code]['welcome'], reply_markup=sect_keyboard, parse_mode='HTML')
+
+
+@router.callback_query(F.data == 'add_task')
+async def add_task_handler(callback_query: CallbackQuery, state: FSMContext):
+    await callback_query.answer("")
+    user_data = await state.get_data()
+    lang_code = user_data.get('language', 'en')
+
+    await state.set_state(Form.task_description)
+    await callback_query.message.answer(texts[lang_code]['task_description'], parse_mode='HTML')
+
 
 @router.message(StateFilter(Form.task_description))
 async def get_task_description(message: Message, state: FSMContext):
@@ -125,6 +139,7 @@ async def get_task_description(message: Message, state: FSMContext):
     await state.set_state(Form.task_deadline)
     await message.answer(texts[lang_code]['task_deadline'], parse_mode='HTML')
 
+
 @router.message(StateFilter(Form.task_deadline))
 async def get_task_deadline(message: Message, state: FSMContext):
     task_deadline = message.text
@@ -133,24 +148,138 @@ async def get_task_deadline(message: Message, state: FSMContext):
     user_id = user_data.get('user_id')
     task_description = user_data.get('task_description')
 
-    try:
-        await add_task(task_description, task_deadline, user_id)
-        await message.answer(texts[lang_code]['task_added'], parse_mode='HTML')
-        await state.reset_state()
-    except Exception as e:
-        logging.error(f"Error adding task: {e}")
-        await message.answer(texts[lang_code]['task_add_error'], parse_mode='HTML')
-        await state.reset_state()
+    new_task = TODO(
+        taskText=task_description,
+        deadLine=task_deadline,
+        isComplete=False,
+        user_id=user_id
+    )
+
+    async with async_session() as session:
+        async with session.begin():
+            session.add(new_task)
+            await session.commit()
+
+    await message.answer(texts[lang_code]['task_added'], parse_mode='HTML')
+    await state.clear()
+
+
+async def get_user_books(session: async_session, user_id: int):
+    async with session() as db_session:
+        result = await db_session.execute(select(ReadingList).where(ReadingList.user_id == user_id))
+        return result.scalars().all()
+
+
+async def books(state: FSMContext, session: async_session):
+    user_data = await state.get_data()
+    lang_code = user_data.get('language', 'en')
+    user_id = user_data.get('user_id')
+    all_books = await get_user_books(session, user_id)
+    keyboard = InlineKeyboardBuilder()
+    for book in all_books:
+        status = '✅' if book.isWatched else '❌'
+        button_text = f"{book.namebook} - {book.author} - {book.descriptBook} {status}"
+        keyboard.add(InlineKeyboardButton(text=button_text, callback_data=f"book_toggle_{book.Id_book}"))
+
+    button_add_text = 'Add Book' if lang_code == 'en' else 'Добавить книгу'
+    button_back_text = 'Back' if lang_code == 'en' else 'Назад'
+    keyboard.add(InlineKeyboardButton(text=button_add_text, callback_data='add_book'))
+    keyboard.add(InlineKeyboardButton(text=button_back_text, callback_data='back'))
+    return keyboard.adjust(1)
+
 
 @router.message(F.text.in_(['Reading List', 'Список чтения']))
-async def reading_list_handler(message: Message, state: FSMContext):
+@router.callback_query(F.data == "reading_list")
+async def reading_list_handler(callback_query: CallbackQuery, state: FSMContext):
+    await callback_query.answer("")
+    user_data = await state.get_data()
+    lang_code = user_data.get('language', 'en')
+    tg_id = callback_query.from_user.id
+    user = await rq.set_user(tg_id)
+    if user:
+        await state.update_data(user_id=user.Id_user)
+
+    keyboard = await books(state, async_session)
+    if isinstance(callback_query, Message):
+        await callback_query.edit_text(texts[lang_code]['reading_list'], reply_markup=keyboard.as_markup(),
+                                       parse_mode='HTML')
+    else:
+        await callback_query.message.edit_text(texts[lang_code]['reading_list'], reply_markup=keyboard.as_markup(),
+                                               parse_mode='HTML')
+
+@router.callback_query(lambda c: c.data.startswith('book_toggle_'))
+async def toggle_book_status(callback_query: CallbackQuery, state: FSMContext):
+    user_data = await state.get_data()
+    lang_code = user_data.get('language', 'en')
+    book_id = int(callback_query.data.split('_')[2])
+    async with async_session() as session:
+        async with session.begin():
+            book = await session.get(ReadingList, book_id)
+            book.isWatched = not book.isWatched
+            await session.commit()
+    await callback_query.answer(texts[lang_code]['book_status_updated'])
+    await reading_list_handler(callback_query, state)
+
+
+@router.callback_query(F.data == 'add_book')
+async def add_book_handler(callback_query: CallbackQuery, state: FSMContext):
+    await callback_query.answer("")
     user_data = await state.get_data()
     lang_code = user_data.get('language', 'en')
 
-    if isinstance(message, Message):
-        await message.answer(texts[lang_code]['reading_list'], parse_mode='HTML')
-    else:
-        await message.message.answer(texts[lang_code]['reading_list'], parse_mode='HTML')
+    await state.set_state(Form.book_namebook)
+    await callback_query.message.answer(texts[lang_code]['book_name'], parse_mode='HTML')
+
+
+@router.message(StateFilter(Form.book_namebook))
+async def get_book_name(message: Message, state: FSMContext):
+    book_namebook = message.text
+    await state.update_data(book_namebook=book_namebook)
+
+    user_data = await state.get_data()
+    lang_code = user_data.get('language', 'en')
+
+    await state.set_state(Form.book_author)
+    await message.answer(texts[lang_code]['book_author'], parse_mode='HTML')
+
+
+@router.message(StateFilter(Form.book_author))
+async def get_book_author(message: Message, state: FSMContext):
+    book_author = message.text
+    await state.update_data(book_author=book_author)
+
+    user_data = await state.get_data()
+    lang_code = user_data.get('language', 'en')
+
+    await state.set_state(Form.book_description)
+    await message.answer(texts[lang_code]['book_desc'], parse_mode='HTML')
+
+
+@router.message(StateFilter(Form.book_description))
+async def get_book_desc(message: Message, state: FSMContext):
+    book_desc = message.text
+    user_data = await state.get_data()
+    lang_code = user_data.get('language', 'en')
+    user_id = user_data.get('user_id')
+    book_namebook = user_data.get('book_namebook')
+    book_author = user_data.get('book_author')
+
+    new_book = ReadingList(
+        namebook=book_namebook,
+        author=book_author,
+        descriptBook=book_desc,
+        isWatched=False,
+        user_id=user_id
+    )
+
+    async with async_session() as session:
+        async with session.begin():
+            session.add(new_book)
+            await session.commit()
+
+    await message.answer(texts[lang_code]['book_added'], parse_mode='HTML')
+    await state.clear()
+
 
 @router.message(F.text.in_(['Diary', 'Дневник']))
 @router.message(Command('diary'))
@@ -164,6 +293,7 @@ async def diary_handler(message_or_callback: Message | CallbackQuery, state: FSM
     else:
         await message_or_callback.message.answer(texts[lang_code]['diary'], parse_mode='HTML')
 
+
 @router.message(F.text.in_(['Diary Entries', 'Записи дневника']))
 @router.message(Command('diary_entries'))
 @router.callback_query(F.data == 'diary_entries')
@@ -171,7 +301,7 @@ async def diary_entries_handler(message_or_callback: Message | CallbackQuery, st
     user_data = await state.get_data()
     lang_code = user_data.get('language', 'en')
 
-    entries = await get_diary_entries()
+    entries = 0
 
     keyboard = InlineKeyboardMarkup(row_width=1, inline_keyboard=[])
     for entry in entries:
@@ -181,7 +311,9 @@ async def diary_entries_handler(message_or_callback: Message | CallbackQuery, st
     if isinstance(message_or_callback, Message):
         await message_or_callback.answer(texts[lang_code]['diary_entries'], reply_markup=keyboard, parse_mode='HTML')
     else:
-        await message_or_callback.message.answer(texts[lang_code]['diary_entries'], reply_markup=keyboard, parse_mode='HTML')
+        await message_or_callback.message.answer(texts[lang_code]['diary_entries'], reply_markup=keyboard,
+                                                 parse_mode='HTML')
+
 
 @router.message()
 async def unknown_command(message: Message, state: FSMContext):
@@ -189,6 +321,3 @@ async def unknown_command(message: Message, state: FSMContext):
     lang_code = user_data.get('language', 'en')
 
     await message.answer(texts[lang_code]['unknown_command'], parse_mode='HTML')
-
-def setup(dp: Dispatcher):
-    dp.include_router(router)
