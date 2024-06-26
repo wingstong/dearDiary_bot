@@ -13,6 +13,8 @@ async def set_user(tg_id):
         return user
 
 
-async def get_tasks():
-    async with async_session() as session:
-        return await session.scalars(select(TODO))
+async def get_user_tasks(session: async_session, user_id: int):
+    async with session() as db_session:
+        result = await db_session.execute(select(TODO).where(TODO.user_id == user_id))
+        return result.scalars().all()
+

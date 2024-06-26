@@ -1,6 +1,7 @@
-from sqlalchemy import BigInteger, Boolean, Column, ForeignKey, Integer, String, Text, Date
+from sqlalchemy import BigInteger, Boolean, Column, ForeignKey, String, Text, DateTime, Integer, Date
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.ext.asyncio import AsyncAttrs, async_sessionmaker, create_async_engine
+from datetime import datetime
 
 engine = create_async_engine(url='sqlite+aiosqlite:///db.sqlite3')
 
@@ -21,6 +22,7 @@ class User(Base):
     diary_entries = relationship("DiaryEntry", back_populates="user")
     mood_journals = relationship("MoodJournal", back_populates="user")
     reading_list = relationship("ReadingList", back_populates="user")
+    calendar_events = relationship("CalendarEvent", back_populates="user")
 
 
 class TODO(Base):
@@ -40,7 +42,7 @@ class DiaryEntry(Base):
 
     id_entry: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(ForeignKey('users.Id_user'))
-    EntryDate: Mapped[str] = mapped_column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
     Content: Mapped[str] = mapped_column(Text)
 
     user = relationship("User", back_populates="diary_entries")
@@ -51,8 +53,9 @@ class MoodJournal(Base):
 
     id_mood: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(ForeignKey('users.Id_user'))
-    entry_date: Mapped[str] = mapped_column(String(50))
-    mood: Mapped[str] = mapped_column(String(50))
+    description: Mapped[str] = mapped_column(String(50))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    mood: Mapped[int] = mapped_column(Integer)
 
     user = relationship("User", back_populates="mood_journals")
 
@@ -69,7 +72,16 @@ class ReadingList(Base):
 
     user = relationship("User", back_populates="reading_list")
 
-    # To create the tables
+
+class CalendarEvent(Base):
+    __tablename__ = 'calendar_events'
+
+    Id_event: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.Id_user'))
+    event_date: Mapped[Date] = mapped_column(Date)
+    description: Mapped[str] = mapped_column(Text)
+
+    user = relationship("User", back_populates="calendar_events")
 
 
 async def create_tables():
