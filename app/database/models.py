@@ -78,7 +78,7 @@ class CalendarEvent(Base):
 
     Id_event: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(ForeignKey('users.Id_user'))
-    event_date: Mapped[Date] = mapped_column(Date)
+    event_date: Mapped[DateTime] = mapped_column(DateTime)
     description: Mapped[str] = mapped_column(Text)
 
     user = relationship("User", back_populates="calendar_events")

@@ -1,18 +1,27 @@
-from aiogram import F, Router, Dispatcher
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import CommandStart, Command, StateFilter
+from aiogram import F, Router
+from aiogram.filters import CommandStart, StateFilter, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from sqlalchemy import select, delete
-
-import app.keyboards as kb
-import app.database.requests as rq
-from app.database.models import *
-from app.texts import texts
+from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from app.calendarr import create_calendar
+from sqlalchemy import select, delete
+import datetime
+import app.keyboards as kb
+from app.database.models import *
+from app.telecalendar import *
+from app.texts import texts
 
 router = Router()
+
+
+async def set_user(tg_id):
+    async with async_session() as session:
+        user = await session.scalar(select(User).where(User.tg_id == tg_id))
+
+        if not user:
+            session.add(User(tg_id=tg_id))
+            await session.commit()
+        return user
 
 
 class Form(StatesGroup):
@@ -32,18 +41,29 @@ class Form(StatesGroup):
     mood_note = State()
     mood_description = State()
 
-    event_description = State()
-    event_date = State()
+    calendar_note = State()
 
 
 @router.message(CommandStart())
 async def c_start(message: Message, state: FSMContext):
     await state.set_state(Form.language)
-    await rq.set_user(message.from_user.id)
+    await set_user(message.from_user.id)
     tg_id = message.from_user.id
-    user = await rq.set_user(tg_id)
+    user = await set_user(tg_id)
+    if user:
+        await state.update_data(user_id=user.Id_user)
     await state.update_data(user_id=user.Id_user)
+
     await message.answer(texts['en']['choose_language'], reply_markup=kb.language_selection, parse_mode='HTML')
+
+
+@router.message(Command('menu'))
+async def c_menu(message: Message, state: FSMContext):
+    user_data = await state.get_data()
+    lang_code = user_data.get('language', 'en')
+
+    sect_keyboard = kb.sections_inline_en if lang_code == 'en' else kb.sections_inline_ru
+    await message.answer(texts[lang_code]['menu'], reply_markup=sect_keyboard, parse_mode='HTML')
 
 
 @router.callback_query(lambda c: c.data.startswith('lang_'))
@@ -60,7 +80,11 @@ async def tasks(callback_query: CallbackQuery, state: FSMContext, session: async
     user_data = await state.get_data()
     lang_code = user_data.get('language', 'en')
     user_id = user_data.get('user_id')
-    all_tasks = await rq.get_user_tasks(session, user_id)
+
+    async with session() as db_session:
+        result = await db_session.execute(select(TODO).where(TODO.user_id == user_id))
+        all_tasks = result.scalars().all()
+
     keyboard = InlineKeyboardBuilder()
     for task in all_tasks:
         status = '✅' if task.isComplete else '❌'
@@ -79,10 +103,6 @@ async def tasks(callback_query: CallbackQuery, state: FSMContext, session: async
 @router.callback_query(F.data == 'task_list')
 async def task_list_handler(callback_query: CallbackQuery, state: FSMContext):
     await callback_query.answer("")
-    tg_id = callback_query.from_user.id
-    user = await rq.set_user(tg_id)
-    if user:
-        await state.update_data(user_id=user.Id_user)
 
     await tasks(callback_query, state, async_session)
 
@@ -107,7 +127,6 @@ async def back_handler(callback_query: CallbackQuery, state: FSMContext):
     user_data = await state.get_data()
     lang_code = user_data.get('language', 'en')
 
-    await state.set_state(Form.task_description)
     sect_keyboard = kb.sections_inline_en if lang_code == 'en' else kb.sections_inline_ru
     await callback_query.message.edit_text(texts[lang_code]['welcome'], reply_markup=sect_keyboard, parse_mode='HTML')
 
@@ -155,14 +174,8 @@ async def get_task_deadline(message: Message, state: FSMContext):
             await session.commit()
 
     keyboard = InlineKeyboardBuilder()
-    keyboard.add(InlineKeyboardButton(text=texts[lang_code]['back'], callback_data='back_Task'))
+    keyboard.add(InlineKeyboardButton(text=texts[lang_code]['back'], callback_data='task_list'))
     await message.answer(texts[lang_code]['task_added'], reply_markup=keyboard.as_markup())
-    await state.clear()
-
-
-@router.callback_query(F.data == "back_Task")
-async def back_task(callback_query: CallbackQuery, state: FSMContext):
-    await task_list_handler(callback_query, state)
 
 
 @router.callback_query(F.data == 'clear_all_tasks')
@@ -279,13 +292,8 @@ async def get_book_desc(message: Message, state: FSMContext):
             await session.commit()
 
     keyboard = InlineKeyboardBuilder()
-    keyboard.add(InlineKeyboardButton(text=texts[lang_code]['back'], callback_data='back_Book'))
+    keyboard.add(InlineKeyboardButton(text=texts[lang_code]['back'], callback_data='reading_list'))
     await message.answer(texts[lang_code]['book_added'], reply_markup=keyboard.as_markup(), parse_mode='HTML')
-
-
-@router.callback_query(F.data == "back_Book")
-async def back_task(callback_query: CallbackQuery, state: FSMContext):
-    await reading_list_handler(callback_query, state)
 
 
 @router.callback_query(F.data == 'clear_all_books')
@@ -326,8 +334,8 @@ async def save_diary_note(message: Message, state: FSMContext):
     user_id = user_data.get('user_id')
 
     # Добавление текущей даты к заметке
-    current_date = datetime.now().strftime("%d.%m.%y")
-    note_with_date = f"{current_date}: {note}"
+    dairy_date = datetime.now().strftime("%d.%m.%y")
+    note_with_date = f"{dairy_date}: {note}"
 
     new_entry = DiaryEntry(
         user_id=user_id,
@@ -423,10 +431,10 @@ async def mood_journal_handler(callback_query: CallbackQuery, state: FSMContext)
 
     keyboard = InlineKeyboardBuilder()
     for mood in mood_notes:
-        date_str = datetime.now().strftime("%d.%m.%y")
+        mood_date = datetime.now().strftime("%d.%m.%y")
         mood_index = int(mood.mood) - 1
         emoji = emojis[mood_index]
-        keyboard.row(InlineKeyboardButton(text=f"{date_str}: {emoji} - {mood.description}",
+        keyboard.row(InlineKeyboardButton(text=f"{mood_date}: {emoji} - {mood.description}",
                                           callback_data=f"mood_note_{mood.id_mood}"))
 
     keyboard.row(
@@ -437,6 +445,24 @@ async def mood_journal_handler(callback_query: CallbackQuery, state: FSMContext)
     await callback_query.message.edit_text(texts[lang_code]['mood_journal'], reply_markup=keyboard.as_markup(),
                                            parse_mode='HTML')
 
+
+@router.callback_query(lambda c: c.data.startswith('mood_note_'))
+async def view_diary_entry(callback_query: CallbackQuery, state: FSMContext):
+    note_id = int(callback_query.data.split('_')[2])
+    user_data = await state.get_data()
+    lang_code = user_data.get('language', 'en')
+
+    async with async_session() as session:
+        mood = await session.get(MoodJournal, note_id)
+
+    mood_date = datetime.now().strftime("%d.%m.%y")
+    mood_index = int(mood.mood) - 1
+    emoji = emojis[mood_index]
+
+    keyboard = InlineKeyboardBuilder()
+    keyboard.add(InlineKeyboardButton(text=texts[lang_code]['back'], callback_data='mood_journal'))
+
+    await callback_query.message.edit_text(text=f"{mood_date}: {emoji} - {mood.description}", reply_markup=keyboard.as_markup(), parse_mode='HTML')
 
 @router.callback_query(F.data == 'add_mood_note')
 async def add_mood_note_handler(callback_query: CallbackQuery, state: FSMContext):
@@ -484,13 +510,8 @@ async def save_mood_description(message: Message, state: FSMContext):
             session.add(new_mood_note)
             await session.commit()
     keyboard = InlineKeyboardBuilder()
-    keyboard.add(InlineKeyboardButton(text=texts[lang_code]['back'], callback_data='back_Mood'))
+    keyboard.add(InlineKeyboardButton(text=texts[lang_code]['back'], callback_data='mood_journal'))
     await message.answer(texts[lang_code]['mood_added'], reply_markup=keyboard.as_markup(), parse_mode='HTML')
-
-
-@router.callback_query(F.data == "back_Mood")
-async def back_mood(callback_query: CallbackQuery, state: FSMContext):
-    await mood_journal_handler(callback_query, state)
 
 
 @router.callback_query(F.data == 'clear_all_mood_notes')
@@ -510,48 +531,89 @@ async def clear_all_mood_notes(callback_query: CallbackQuery, state: FSMContext)
 
 
 @router.callback_query(F.data == 'calendar')
-async def process_calendar(callback_query: CallbackQuery, state: FSMContext):
-    data = callback_query.data.split(';')
-    action = data[0]
-
-    if action == 'calendar':
-        if len(data) == 4:  # Ensure there are enough elements
-            year, month, day = int(data[1]), int(data[2]), int(data[3])
-            selected_date = datetime(year, month, day).date()
-            await state.update_data(event_date=selected_date)
-            await callback_query.message.answer(
-                f"Вы выбрали дату: {selected_date}. {texts[callback_query.from_user.language_code]['event_description']}")
-            await state.set_state(Form.event_description)
-        else:
-            await callback_query.answer("Некорректные данные календаря.")
-    elif action in ['calendar_prev', 'calendar_next']:
-        if len(data) == 3:  # Ensure there are enough elements
-            year, month = int(data[1]), int(data[2])
-            if action == 'calendar_prev':
-                month -= 1
-                if month == 0:
-                    month = 12
-                    year -= 1
-            elif action == 'calendar_next':
-                month += 1
-                if month == 13:
-                    month = 1
-                    year += 1
-            await callback_query.message.edit_reply_markup(create_calendar(year, month))
-        else:
-            await callback_query.answer("Некорректные данные навигации по календарю.")
-
-
-@router.message(StateFilter(Form.event_description))
-async def get_event_description(message: Message, state: FSMContext):
-    event_description = message.text
+async def on_calendar(callback_query: CallbackQuery, state: FSMContext):
+    await callback_query.answer("")
     user_data = await state.get_data()
-    event_date = user_data.get('event_date')
+    lang_code = user_data.get('language', 'en')
+
+    today = datetime.today()
+    await callback_query.message.edit_text(
+        texts[lang_code]['calendar'],
+        reply_markup=create_calendar(lang_code, today.year, today.month),
+        parse_mode='HTML')
+
+
+@router.callback_query(lambda c: c.data.startswith('DAY'))
+async def calendar_day_handler(callback_query: CallbackQuery, state: FSMContext):
+    await callback_query.answer("")
+    user_data = await state.get_data()
+    lang_code = user_data.get('language', 'en')
+    selected_date_str = callback_query.data.split('DAY')[1]
+
+    selected_date_str = selected_date_str.strip('_')  # Strip leading and trailing underscores
+
+    day, month, year = map(int, selected_date_str.split('_'))
+    selected_date = datetime(year, month, day)
+    await state.update_data(selected_date=selected_date)
+
+    await state.update_data(selected_date=selected_date)
+
+    await state.set_state(Form.calendar_note)
+    await callback_query.message.answer(texts[lang_code]['event_description'], parse_mode='HTML')
+
+
+@router.callback_query(lambda c: c.data.startswith('PREV-MONTH'))
+async def prev_month_handler(callback_query: CallbackQuery, state: FSMContext):
+    await callback_query.answer("")
+    user_data = await state.get_data()
+    lang_code = user_data.get('language', 'en')
+    data = callback_query.data.split('_')
+    month, year = int(data[1]), int(data[2])
+
+    # Переключаем на предыдущий месяц
+    if month == 1:
+        month = 12
+        year -= 1
+    else:
+        month -= 1
+
+    # Создаем новую клавиатуру для предыдущего месяца
+    new_calendar = create_calendar(lang_code, year, month,)
+
+    await callback_query.message.edit_reply_markup(reply_markup=new_calendar)
+
+
+@router.callback_query(lambda c: c.data.startswith('NEXT-MONTH'))
+async def next_month_handler(callback_query: CallbackQuery, state: FSMContext):
+    await callback_query.answer("")
+    user_data = await state.get_data()
+    lang_code = user_data.get('language', 'en')
+    data = callback_query.data.split('_')
+    month, year = int(data[1]), int(data[2])
+
+    # Переключаем на следующий месяц
+    if month == 12:
+        month = 1
+        year += 1
+    else:
+        month += 1
+
+    # Создаем новую клавиатуру для следующего месяца
+    new_calendar = create_calendar(lang_code, year, month)
+
+    await callback_query.message.edit_reply_markup(reply_markup=new_calendar)
+
+@router.message(StateFilter(Form.calendar_note))
+async def calendar_note_handler(message: Message, state: FSMContext):
+    note = message.text
+    user_data = await state.get_data()
+    lang_code = user_data.get('language', 'en')
     user_id = user_data.get('user_id')
+    selected_date = user_data.get('selected_date')
 
     new_event = CalendarEvent(
-        event_date=event_date,
-        description=event_description,
+        event_date=selected_date,
+        description=note,
         user_id=user_id
     )
 
@@ -560,39 +622,68 @@ async def get_event_description(message: Message, state: FSMContext):
             session.add(new_event)
             await session.commit()
 
-    await message.answer(texts[user_data['language']]['event_added'])
-    await state.clear()
+    keyboard = InlineKeyboardBuilder()
+    keyboard.add(InlineKeyboardButton(text=texts[lang_code]['back'], callback_data='calendar'))
+    await message.answer(texts[lang_code]['event_added'], reply_markup=keyboard.as_markup(), parse_mode='HTML')
 
 
-@router.message(Command('show_events'))
-async def show_events(message: Message, state: FSMContext):
+@router.callback_query(F.data == 'show_events')
+async def show_events_handler(callback_query: CallbackQuery, state: FSMContext):
+    await callback_query.answer("")
     user_data = await state.get_data()
+    lang_code = user_data.get('language', 'en')
+    user_id = user_data.get('user_id')
+
+    async with async_session() as session:
+        result = await session.execute(select(CalendarEvent).where(CalendarEvent.user_id == user_id))
+        events = result.scalars().all()
+
+    keyboard = InlineKeyboardBuilder()
+    for event in events:
+        formatted_date = event.event_date.strftime("%d.%m.%y")
+        button_text = f"{formatted_date}: {event.description}"
+        keyboard.row(InlineKeyboardButton(text=button_text, callback_data=f'event_note_{event.Id_event}'))
+
+    keyboard.row(
+        InlineKeyboardButton(text=texts[lang_code]['clear_all_notes'], callback_data='clear_all_events'),
+        InlineKeyboardButton(text=texts[lang_code]['back'], callback_data='calendar')
+    )
+
+    await callback_query.message.edit_text(texts[lang_code]['show_events'], reply_markup=keyboard.as_markup(),
+                                           parse_mode='HTML')
+
+
+@router.callback_query(lambda c: c.data.startswith('event_note_'))
+async def view_diary_entry(callback_query: CallbackQuery, state: FSMContext):
+    event_id = int(callback_query.data.split('_')[2])
+    user_data = await state.get_data()
+    lang_code = user_data.get('language', 'en')
+
+    async with async_session() as session:
+        event = await session.get(CalendarEvent, event_id)
+
+    e_date = event.event_date.strftime("%d.%m.%y")
+    e_note = f"{e_date}: {event.description}"
+    keyboard = InlineKeyboardBuilder()
+    keyboard.add(InlineKeyboardButton(text=texts[lang_code]['back'], callback_data='show_events'))
+
+    await callback_query.message.edit_text(text=e_note, reply_markup=keyboard.as_markup(), parse_mode='HTML')
+
+
+@router.callback_query(F.data == 'clear_all_events')
+async def clear_all_events(callback_query: CallbackQuery, state: FSMContext):
+    await callback_query.answer("")
+    user_data = await state.get_data()
+    lang_code = user_data.get('language', 'en')
     user_id = user_data.get('user_id')
 
     async with async_session() as session:
         async with session.begin():
-            result = await session.execute(select(CalendarEvent).where(CalendarEvent.user_id == user_id))
-            events = result.scalars().all()
+            await session.execute(delete(CalendarEvent).where(CalendarEvent.user_id == user_id))
+            await session.commit()
 
-    if events:
-        events_text = f"{texts[user_data['language']]['calendar_event']}\n"
-        for event in events:
-            events_text += f"{event.event_date}: {event.description}\n"
-        await message.answer(events_text)
-    else:
-        await message.answer(texts[user_data['language']]['no_events'])
-
-
-@router.message(Command('add_event'))
-async def add_event(message: Message, state: FSMContext):
-    await state.set_state(Form.event_date)
-    await message.answer(texts[message.from_user.language_code]['calendar_event'], reply_markup=create_calendar())
-
-
-@router.message(StateFilter(Form.event_date))
-async def select_event_date(message: Message, state: FSMContext):
-    await message.answer(texts[message.from_user.language_code]['calendar_event'], reply_markup=create_calendar())
-
+    await callback_query.message.edit_text(texts[lang_code]['all_events_cleared'], parse_mode='HTML')
+    await show_events_handler(callback_query, state)
 
 @router.message()
 async def unknown_command(message: Message, state: FSMContext):
